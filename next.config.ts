@@ -4,9 +4,6 @@ const nextConfig: NextConfig = {
   reactStrictMode: true,
   typedRoutes: true,
   experimental: {
-    serverActions: {
-      bodySizeLimit: "500mb"
-    },
     turbopackFileSystemCacheForDev: true
   },
   async headers() {

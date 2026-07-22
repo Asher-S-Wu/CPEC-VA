@@ -2,7 +2,6 @@
 
 import { useRef, useState, type ChangeEvent, type FormEvent, type KeyboardEvent } from "react";
 import { useRouter } from "next/navigation";
-import { upload } from "@vercel/blob/client";
 import { Link2, Loader2, Sparkles, Upload, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { readJson } from "@/lib/client/api";
@@ -42,10 +41,9 @@ function captureFirstFrame(file: File): Promise<string> {
     video.src = url;
 
     let settled = false;
-    let timeoutId: number | undefined;
 
     const cleanup = () => {
-      if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+      window.clearTimeout(timeoutId);
       URL.revokeObjectURL(url);
       video.removeAttribute("src");
       video.load();
@@ -86,7 +84,7 @@ function captureFirstFrame(file: File): Promise<string> {
     video.addEventListener("canplay", draw);
     video.addEventListener("error", () => finish(""));
     // 防止某些浏览器不触发事件导致一直挂着
-    timeoutId = window.setTimeout(() => finish(""), 5000);
+    const timeoutId = window.setTimeout(() => finish(""), 5000);
   });
 }
 
@@ -137,48 +135,50 @@ export function HomeUrlInput() {
     setError("");
   }
 
-  async function handleUploadSubmit() {
+  function handleUploadSubmit() {
     if (!uploadedFile) return;
     setLoading(true);
     setError("");
     setUploadProgress(0);
 
-    try {
-      // 浏览器把视频直接传到 Vercel Blob，绕开接口 4.5MB 请求体上限
-      const blob = await upload(uploadedFile.name, uploadedFile.file, {
-        access: "public",
-        handleUploadUrl: "/api/video-brief/upload-token",
-        contentType: uploadedFile.file.type,
-        multipart: true,
-        onUploadProgress: (event) => {
-          setUploadProgress(Math.round(event.percentage));
-        },
-      });
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/video-brief/analyze-upload");
 
-      // 把 Blob 地址交给后端，由后端拉取视频并做 AI 解读
-      const response = await fetch("/api/video-brief/analyze-upload", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          blobUrl: blob.url,
-          filename: uploadedFile.name,
-          coverDataUrl: uploadedFile.coverDataUrl || undefined,
-        }),
-      });
-      const data = await readJson(response);
-      const archive = data.archive as { id: string } | undefined;
-      if (archive?.id) {
-        router.push(`/v/${archive.id}`);
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) {
+        setUploadProgress(Math.round((event.loaded / event.total) * 100));
+      }
+    };
+
+    xhr.onload = () => {
+      let data: { ok?: boolean; message?: string; archive?: { id: string } } = {};
+      try {
+        data = JSON.parse(xhr.responseText);
+      } catch {
+        data = { message: "视频速览失败" };
+      }
+
+      if (xhr.status >= 200 && xhr.status < 300 && data.archive?.id) {
+        router.push(`/v/${data.archive.id}`);
       } else {
-        setError("分析完成，但未返回视频详情");
+        setError(data.message || "视频速览失败");
         setLoading(false);
         setUploadProgress(0);
       }
-    } catch (uploadError) {
-      setError(getErrorMessage(uploadError, "视频速览失败"));
+    };
+
+    xhr.onerror = () => {
+      setError("网络异常，视频上传失败");
       setLoading(false);
       setUploadProgress(0);
+    };
+
+    const form = new FormData();
+    form.append("file", uploadedFile.file);
+    if (uploadedFile.coverDataUrl) {
+      form.append("coverDataUrl", uploadedFile.coverDataUrl);
     }
+    xhr.send(form);
   }
 
   async function handleUrlSubmit() {
