@@ -303,7 +303,7 @@ export function HomeUrlInput() {
               value={url}
               onChange={handleChange}
               onKeyDown={handleKeyDown}
-              placeholder="粘贴 B 站、优酷、芒果 TV 或视频直链"
+              placeholder="粘贴视频平台或公开视频链接"
               rows={1}
               disabled={loading}
               className="home-input-field"
@@ -325,7 +325,8 @@ export function HomeUrlInput() {
       </form>
       {error ? <p className="home-input-error">{error}</p> : null}
       <p className="home-input-hint">
-        支持粘贴 B 站、优酷、芒果 TV 或视频直链（限 10 分钟以内），也可点击左侧上传图标上传本地视频（限 50 MB 以内）
+        支持 B 站、优酷、芒果 TV、AcFun、微博、小红书、央视网、PeerTube、互联网档案馆、Wikimedia Commons
+        及视频直链（限 10 分钟以内），也可点击左侧上传图标上传本地视频（限 50 MB 以内）
       </p>
     </div>
   );

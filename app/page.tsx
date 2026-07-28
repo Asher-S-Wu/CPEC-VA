@@ -31,7 +31,7 @@ export default async function HomePage() {
     >
       <div className="home-welcome">
         <h1 className="home-welcome-title">粘贴视频链接，AI 自动解读</h1>
-        <p className="home-welcome-subtitle">支持 B 站、优酷、芒果 TV 和视频直链</p>
+        <p className="home-welcome-subtitle">支持多种视频平台、开放视频站与视频直链</p>
         <HomeUrlInput />
       </div>
     </ChatShell>

@@ -1,14 +1,28 @@
 import { resolveBailianProviderConfig } from "@/lib/ai/modelRoutes";
-import { assertPublicHttpUrl } from "@/lib/video-brief/extractors";
+import {
+  assertPublicHttpUrl,
+  BROWSER_USER_AGENT,
+  decodeResourceText,
+  fetchPublicResource,
+  fetchPublicText,
+  MAX_PLAYLIST_BYTES,
+  MAX_REMOTE_VIDEO_BYTES,
+} from "@/lib/video-brief/extractors/http";
+import { VideoSourceError } from "@/lib/video-brief/extractors/errors";
 import type { ExtractedVideoSource, VideoBriefAnalysis } from "@/types/video-brief";
 
 export const VIDEO_BRIEF_MODEL = "qwen3.5-omni-flash";
 
-const DOWNLOAD_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 const HLS_URL_RE = /\.m3u8(?:$|[?#])/i;
 const HLS_MIME_TYPES = new Set(["application/x-mpegurl", "application/vnd.apple.mpegurl"]);
 const MAX_HLS_SEGMENTS = 800;
-const HLS_FETCH_BATCH_SIZE = 6;
+const REMOTE_DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
+const POLICY_REQUEST_TIMEOUT_MS = 30_000;
+const VIDEO_UPLOAD_TIMEOUT_MS = 3 * 60_000;
+const MODEL_REQUEST_TIMEOUT_MS = 10 * 60_000;
+const MAX_POLICY_RESPONSE_BYTES = 1024 * 1024;
+const MAX_MODEL_RESPONSE_BYTES = 2 * 1024 * 1024;
+const MAX_UPLOAD_ERROR_BYTES = 64 * 1024;
 
 class VideoBriefAnalysisError extends Error {
   status: number;
@@ -22,6 +36,110 @@ class VideoBriefAnalysisError extends Error {
 interface DownloadedVideoFile {
   blob: Blob;
   filename: string;
+}
+
+class DownloadByteBudget {
+  private used = 0;
+
+  constructor(private readonly maximum: number) {}
+
+  get remaining() {
+    return Math.max(0, this.maximum - this.used);
+  }
+
+  consume(bytes: number) {
+    this.used += bytes;
+    if (this.used > this.maximum) {
+      throw new VideoBriefAnalysisError("视频文件超过允许的大小", 413);
+    }
+  }
+}
+
+function createTimedSignal(
+  parent: AbortSignal | undefined,
+  timeoutMs: number,
+  timeoutMessage: string,
+) {
+  const controller = new AbortController();
+  let timedOut = false;
+  const abortFromParent = () => controller.abort(parent?.reason);
+  if (parent?.aborted) {
+    abortFromParent();
+  } else {
+    parent?.addEventListener("abort", abortFromParent, { once: true });
+  }
+  const timeoutId = setTimeout(() => {
+    if (controller.signal.aborted) return;
+    timedOut = true;
+    controller.abort(new DOMException(timeoutMessage, "TimeoutError"));
+  }, timeoutMs);
+
+  return {
+    signal: controller.signal,
+    get timedOut() {
+      return timedOut;
+    },
+    cleanup() {
+      clearTimeout(timeoutId);
+      parent?.removeEventListener("abort", abortFromParent);
+    },
+  };
+}
+
+async function runWithStageTimeout<T>(
+  parent: AbortSignal | undefined,
+  timeoutMs: number,
+  label: string,
+  task: (signal: AbortSignal) => Promise<T>,
+) {
+  const operation = createTimedSignal(parent, timeoutMs, `${label}超时`);
+  try {
+    return await task(operation.signal);
+  } catch (error) {
+    if (operation.timedOut) {
+      throw new VideoBriefAnalysisError(`${label}超时`, 504);
+    }
+    if (parent?.aborted) {
+      throw new VideoBriefAnalysisError("视频处理已取消", 499);
+    }
+    if (error instanceof VideoBriefAnalysisError) throw error;
+    throw new VideoBriefAnalysisError(`${label}失败`, 502);
+  } finally {
+    operation.cleanup();
+  }
+}
+
+async function readBoundedResponseText(
+  response: Response,
+  maxBytes: number,
+  label: string,
+) {
+  const contentLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    await response.body?.cancel();
+    throw new VideoBriefAnalysisError(`${label}返回内容过大`, 502);
+  }
+  if (!response.body) return "";
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let text = "";
+  let total = 0;
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      total += chunk.value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new VideoBriefAnalysisError(`${label}返回内容过大`, 502);
+      }
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+    return text + decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 function getChoiceText(payload: any) {
@@ -129,13 +247,10 @@ function buildPrompt(source: ExtractedVideoSource) {
 }
 
 function getDownloadHeaders(source: ExtractedVideoSource) {
-  const headers: Record<string, string> = {
-    "User-Agent": DOWNLOAD_USER_AGENT,
+  return {
+    "User-Agent": BROWSER_USER_AGENT,
+    ...(source.media.headers || {}),
   };
-  if (source.mediaReferer) {
-    headers["Referer"] = source.mediaReferer;
-  }
-  return headers;
 }
 
 function isHlsUrl(url: string) {
@@ -153,7 +268,7 @@ function isHlsMimeType(value: string) {
 
 function getVideoExtension(url: string) {
   try {
-    const match = new URL(url).pathname.match(/\.(mp4|flv|mov|webm|ts)$/i);
+    const match = new URL(url).pathname.match(/\.(mp4|flv|mov|webm|ogv|ts)$/i);
     return match?.[1]?.toLowerCase() || "mp4";
   } catch {
     return "mp4";
@@ -228,44 +343,85 @@ function parseHlsPlaylist(text: string, playlistUrl: string) {
   return { variantUrl: "", segments, initUrl };
 }
 
-async function fetchBytes(url: string, headers: Record<string, string>, signal?: AbortSignal) {
-  const response = await fetch(url, { headers, signal });
-  if (!response.ok) {
-    throw new VideoBriefAnalysisError(`视频片段下载失败（${response.status}）`, 502);
-  }
-  return new Uint8Array(await response.arrayBuffer());
+function toArrayBuffer(bytes: Uint8Array<ArrayBuffer>) {
+  return bytes.buffer;
 }
 
-function toArrayBuffer(bytes: Uint8Array) {
-  const buffer = new ArrayBuffer(bytes.byteLength);
-  new Uint8Array(buffer).set(bytes);
-  return buffer;
+async function fetchPlaylist(
+  url: string,
+  headers: Record<string, string>,
+  signal?: AbortSignal,
+) {
+  try {
+    const response = await fetchPublicText(
+      url,
+      { headers, signal },
+      {
+        maxBytes: MAX_PLAYLIST_BYTES,
+        timeoutMs: 30_000,
+        label: "视频流",
+      },
+    );
+    if (!response.ok) {
+      throw new VideoBriefAnalysisError(`视频流读取失败（${response.status}）`, 502);
+    }
+    return { text: response.text, url: response.url };
+  } catch (error) {
+    if (error instanceof VideoSourceError) {
+      throw new VideoBriefAnalysisError(error.message, error.status);
+    }
+    throw error;
+  }
 }
 
-async function fetchText(url: string, headers: Record<string, string>, signal?: AbortSignal) {
-  const response = await fetch(url, { headers, signal });
-  if (!response.ok) {
-    throw new VideoBriefAnalysisError(`视频流读取失败（${response.status}）`, 502);
+async function fetchSegment(
+  url: string,
+  headers: Record<string, string>,
+  budget: DownloadByteBudget,
+  signal?: AbortSignal,
+) {
+  if (budget.remaining <= 0) {
+    throw new VideoBriefAnalysisError("视频文件超过允许的大小", 413);
   }
-  return {
-    text: await response.text(),
-    url: response.url || url,
-  };
+  try {
+    const response = await fetchPublicResource(
+      url,
+      { headers, signal },
+      {
+        maxBytes: budget.remaining,
+        timeoutMs: 30_000,
+        label: "视频片段",
+      },
+    );
+    if (!response.ok) {
+      throw new VideoBriefAnalysisError(`视频片段下载失败（${response.status}）`, 502);
+    }
+    budget.consume(response.body.byteLength);
+    return response.body;
+  } catch (error) {
+    if (error instanceof VideoSourceError) {
+      throw new VideoBriefAnalysisError(error.message, error.status);
+    }
+    throw error;
+  }
 }
 
 async function downloadHlsVideo(
   initialText: string,
   initialUrl: string,
   headers: Record<string, string>,
+  budget: DownloadByteBudget,
   signal?: AbortSignal,
 ): Promise<DownloadedVideoFile> {
   let playlistText = initialText;
   let playlistUrl = initialUrl;
+  budget.consume(new TextEncoder().encode(initialText).byteLength);
 
   for (let depth = 0; depth < 4; depth += 1) {
     const playlist = parseHlsPlaylist(playlistText, playlistUrl);
     if (playlist.variantUrl) {
-      const next = await fetchText(playlist.variantUrl, headers, signal);
+      const next = await fetchPlaylist(playlist.variantUrl, headers, signal);
+      budget.consume(new TextEncoder().encode(next.text).byteLength);
       playlistText = next.text;
       playlistUrl = next.url;
       continue;
@@ -278,15 +434,13 @@ async function downloadHlsVideo(
       throw new VideoBriefAnalysisError("视频片段过多，请换一个更短的视频", 400);
     }
 
-    const parts: Uint8Array[] = [];
+    const parts: Uint8Array<ArrayBuffer>[] = [];
     if (playlist.initUrl) {
-      parts.push(await fetchBytes(playlist.initUrl, headers, signal));
+      parts.push(await fetchSegment(playlist.initUrl, headers, budget, signal));
     }
 
-    for (let index = 0; index < playlist.segments.length; index += HLS_FETCH_BATCH_SIZE) {
-      const batch = playlist.segments.slice(index, index + HLS_FETCH_BATCH_SIZE);
-      const batchParts = await Promise.all(batch.map((url) => fetchBytes(url, headers, signal)));
-      parts.push(...batchParts);
+    for (const segmentUrl of playlist.segments) {
+      parts.push(await fetchSegment(segmentUrl, headers, budget, signal));
     }
 
     const extension = playlist.initUrl ? "mp4" : "ts";
@@ -307,26 +461,77 @@ async function downloadHlsVideo(
 // 把视频原文件下载到内存。B 站等有防盗链的平台需要带上来源页 Referer。
 async function downloadVideo(source: ExtractedVideoSource, signal?: AbortSignal): Promise<DownloadedVideoFile> {
   const headers = getDownloadHeaders(source);
+  const budget = new DownloadByteBudget(MAX_REMOTE_VIDEO_BYTES);
+  const download = createTimedSignal(
+    signal,
+    REMOTE_DOWNLOAD_TIMEOUT_MS,
+    "视频下载超时",
+  );
 
-  const response = await fetch(source.videoUrl, { headers, signal });
-  if (!response.ok) {
-    throw new VideoBriefAnalysisError(`视频下载失败（${response.status}）`, 502);
-  }
+  try {
+    if (source.media.kind === "hls") {
+      const playlist = await fetchPlaylist(
+        source.media.url,
+        headers,
+        download.signal,
+      );
+      return await downloadHlsVideo(
+        playlist.text,
+        playlist.url,
+        headers,
+        budget,
+        download.signal,
+      );
+    }
 
-  const responseUrl = response.url || source.videoUrl;
-  const contentType = response.headers.get("content-type") || "";
-  if (isHlsUrl(responseUrl) || isHlsMimeType(contentType)) {
-    return downloadHlsVideo(await response.text(), responseUrl, headers, signal);
+    const response = await fetchPublicResource(
+      source.media.url,
+      { headers, signal: download.signal },
+      {
+        maxBytes: MAX_REMOTE_VIDEO_BYTES,
+        timeoutMs: 2 * 60_000,
+        label: "视频文件",
+      },
+    );
+    if (!response.ok) {
+      throw new VideoBriefAnalysisError(`视频下载失败（${response.status}）`, 502);
+    }
+    if (response.body.byteLength === 0) {
+      throw new VideoBriefAnalysisError("视频内容为空", 502);
+    }
+    const contentType = response.headers.get("content-type") || source.media.mimeType || "";
+    if (isHlsUrl(response.url) || isHlsMimeType(contentType)) {
+      return await downloadHlsVideo(
+        decodeResourceText(response),
+        response.url,
+        headers,
+        budget,
+        download.signal,
+      );
+    }
+    budget.consume(response.body.byteLength);
+    const mimeType = contentType || "application/octet-stream";
+    const blob = new Blob([toArrayBuffer(response.body)], { type: mimeType });
+    return {
+      blob,
+      filename: `video-${Date.now()}.${
+        source.media.extension || getVideoExtension(response.url)
+      }`,
+    };
+  } catch (error) {
+    if (download.timedOut) {
+      throw new VideoBriefAnalysisError("视频下载超时", 504);
+    }
+    if (signal?.aborted) {
+      throw new VideoBriefAnalysisError("视频处理已取消", 499);
+    }
+    if (error instanceof VideoSourceError) {
+      throw new VideoBriefAnalysisError(error.message, error.status);
+    }
+    throw error;
+  } finally {
+    download.cleanup();
   }
-
-  const blob = await response.blob();
-  if (blob.size === 0) {
-    throw new VideoBriefAnalysisError("视频内容为空", 502);
-  }
-  return {
-    blob,
-    filename: `video-${Date.now()}.${getVideoExtension(responseUrl)}`,
-  };
 }
 
 interface BailianUploadPolicy {
@@ -346,65 +551,92 @@ async function fetchBailianUploadPolicy(
   model: string,
   signal?: AbortSignal,
 ): Promise<BailianUploadPolicy> {
-  const url = `${dashScopeBaseUrl}/uploads?action=getPolicy&model=${encodeURIComponent(model)}`;
-  const response = await fetch(url, {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
+  return runWithStageTimeout(
     signal,
-  });
+    POLICY_REQUEST_TIMEOUT_MS,
+    "获取视频上传凭证",
+    async (stageSignal) => {
+      const url = `${dashScopeBaseUrl}/uploads?action=getPolicy&model=${encodeURIComponent(model)}`;
+      const response = await fetch(url, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        signal: stageSignal,
+      });
 
-  const text = await response.text();
-  let payload: any = {};
-  if (text) {
-    try {
-      payload = JSON.parse(text);
-    } catch {
-      payload = { message: text };
+      const text = await readBoundedResponseText(
+        response,
+        MAX_POLICY_RESPONSE_BYTES,
+        "视频上传凭证",
+      );
+      let payload: any = {};
+      if (text) {
+        try {
+          payload = JSON.parse(text);
+        } catch {
+          payload = { message: text };
+        }
+      }
+
+      if (!response.ok || payload?.code) {
+        throw new VideoBriefAnalysisError(
+          payload?.message || `获取视频上传凭证失败（${response.status}）`,
+          response.ok ? 502 : response.status,
+        );
+      }
+
+      const data = payload?.data;
+      if (!data?.policy || !data?.upload_host || !data?.upload_dir) {
+        throw new VideoBriefAnalysisError("视频上传凭证格式不正确", 502);
+      }
+
+      return data as BailianUploadPolicy;
     }
-  }
-
-  if (!response.ok || payload?.code) {
-    throw new VideoBriefAnalysisError(
-      payload?.message || `获取视频上传凭证失败（${response.status}）`,
-      response.ok ? 502 : response.status,
-    );
-  }
-
-  const data = payload?.data;
-  if (!data?.policy || !data?.upload_host || !data?.upload_dir) {
-    throw new VideoBriefAnalysisError("视频上传凭证格式不正确", 502);
-  }
-
-  return data as BailianUploadPolicy;
+  );
 }
 
 // 把视频上传到百炼临时存储，返回阿里云内网地址 oss://...，模型从内网读取，彻底绕开 60 秒下载超时。
 async function uploadVideoToBailian(policy: BailianUploadPolicy, file: DownloadedVideoFile, signal?: AbortSignal) {
-  const key = `${policy.upload_dir}/${file.filename}`;
+  return runWithStageTimeout(
+    signal,
+    VIDEO_UPLOAD_TIMEOUT_MS,
+    "视频上传",
+    async (stageSignal) => {
+      const key = `${policy.upload_dir}/${file.filename}`;
+      const form = new FormData();
+      form.append("OSSAccessKeyId", policy.oss_access_key_id);
+      form.append("Signature", policy.signature);
+      form.append("policy", policy.policy);
+      form.append("key", key);
+      form.append("x-oss-object-acl", policy.x_oss_object_acl);
+      form.append("x-oss-forbid-overwrite", policy.x_oss_forbid_overwrite);
+      form.append("success_action_status", "200");
+      form.append("file", file.blob, file.filename);
 
-  const form = new FormData();
-  form.append("OSSAccessKeyId", policy.oss_access_key_id);
-  form.append("Signature", policy.signature);
-  form.append("policy", policy.policy);
-  form.append("key", key);
-  form.append("x-oss-object-acl", policy.x_oss_object_acl);
-  form.append("x-oss-forbid-overwrite", policy.x_oss_forbid_overwrite);
-  form.append("success_action_status", "200");
-  form.append("file", file.blob, file.filename);
-
-  const response = await fetch(policy.upload_host, { method: "POST", body: form, signal });
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new VideoBriefAnalysisError(
-      `视频上传失败（${response.status}）${body ? `：${body.slice(0, 200)}` : ""}`,
-      502,
-    );
-  }
-
-  return `oss://${key}`;
+      const response = await fetch(policy.upload_host, {
+        method: "POST",
+        body: form,
+        signal: stageSignal,
+      });
+      if (!response.ok) {
+        const body = await readBoundedResponseText(
+          response,
+          MAX_UPLOAD_ERROR_BYTES,
+          "视频上传",
+        );
+        throw new VideoBriefAnalysisError(
+          `视频上传失败（${response.status}）${
+            body ? `：${body.slice(0, 200)}` : ""
+          }`,
+          502,
+        );
+      }
+      await response.body?.cancel();
+      return `oss://${key}`;
+    },
+  );
 }
 
 // 共用的"上传百炼 → 调 AI → 解析"流程。无论是从网址下载还是用户直传，拿到视频 Blob 后都走这里。
@@ -414,64 +646,81 @@ async function runBailianAnalysis(file: DownloadedVideoFile, source: ExtractedVi
   const policy = await fetchBailianUploadPolicy(apiKey, dashScopeBaseUrl, VIDEO_BRIEF_MODEL, signal);
   const ossUrl = await uploadVideoToBailian(policy, file, signal);
 
-  const response = await fetch(`${openAIBaseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      // 必需：让百炼解析 oss:// 内网地址
-      "X-DashScope-OssResourceResolve": "enable",
-    },
-    body: JSON.stringify({
-      model: VIDEO_BRIEF_MODEL,
-      messages: [
-        {
-          role: "user",
-          content: [
+  return runWithStageTimeout(
+    signal,
+    MODEL_REQUEST_TIMEOUT_MS,
+    "视频理解",
+    async (stageSignal) => {
+      const response = await fetch(`${openAIBaseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          // 必需：让百炼解析 oss:// 内网地址
+          "X-DashScope-OssResourceResolve": "enable",
+        },
+        body: JSON.stringify({
+          model: VIDEO_BRIEF_MODEL,
+          messages: [
             {
-              type: "video_url",
-              video_url: {
-                url: ossUrl,
-                fps: 10,
-                min_pixels: 65536,
-                max_pixels: 2048000,
-                total_pixels: 184549376,
-              },
-            },
-            {
-              type: "text",
-              text: buildPrompt(source),
+              role: "user",
+              content: [
+                {
+                  type: "video_url",
+                  video_url: {
+                    url: ossUrl,
+                    fps: 10,
+                    min_pixels: 65536,
+                    max_pixels: 2048000,
+                    total_pixels: 184549376,
+                  },
+                },
+                {
+                  type: "text",
+                  text: buildPrompt(source),
+                },
+              ],
             },
           ],
-        },
-      ],
-      modalities: ["text"],
-      stream: false,
-    }),
-    signal,
-  });
+          modalities: ["text"],
+          stream: false,
+        }),
+        signal: stageSignal,
+      });
 
-  const text = await response.text();
-  let payload: any = {};
-  if (text) {
-    try {
-      payload = JSON.parse(text);
-    } catch {
-      payload = { message: text };
-    }
-  }
+      const text = await readBoundedResponseText(
+        response,
+        MAX_MODEL_RESPONSE_BYTES,
+        "视频理解",
+      );
+      let payload: any = {};
+      if (text) {
+        try {
+          payload = JSON.parse(text);
+        } catch {
+          payload = { message: text };
+        }
+      }
 
-  if (!response.ok || payload?.error) {
-    const message = payload?.error?.message || payload?.message || `视频理解失败（${response.status}）`;
-    throw new VideoBriefAnalysisError(message, response.ok ? 502 : response.status);
-  }
+      if (!response.ok || payload?.error) {
+        const message =
+          payload?.error?.message ||
+          payload?.message ||
+          `视频理解失败（${response.status}）`;
+        throw new VideoBriefAnalysisError(
+          message,
+          response.ok ? 502 : response.status,
+        );
+      }
 
-  const outputText = getChoiceText(payload);
-  if (!outputText) {
-    throw new VideoBriefAnalysisError("模型没有返回视频解读结果");
-  }
+      const outputText = getChoiceText(payload);
+      if (!outputText) {
+        throw new VideoBriefAnalysisError("模型没有返回视频解读结果");
+      }
 
-  return normalizeAnalysis(parseJsonObject(outputText));
+      return normalizeAnalysis(parseJsonObject(outputText));
+    },
+  );
 }
 
 export async function analyzeVideo(source: ExtractedVideoSource, signal?: AbortSignal) {
@@ -491,12 +740,16 @@ export async function analyzeVideoFromBlob(
   const source: ExtractedVideoSource = {
     sourceUrl: `local://${filename}`,
     canonicalUrl: `local://${filename}`,
+    platformId: "local",
     platform: sourceMeta.platform,
     title: sourceMeta.title,
     author: sourceMeta.author || "",
     coverUrl: "",
     durationSeconds: 0,
-    videoUrl: "",
+    media: {
+      kind: "file",
+      url: "",
+    },
   };
   return runBailianAnalysis(file, source, signal);
 }
